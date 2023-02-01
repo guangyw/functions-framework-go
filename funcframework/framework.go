@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
+	"log"
 	"net/http"
 	"os"
 	"reflect"
@@ -37,6 +38,7 @@ const (
 	errorStatus              = "error"
 	panicMessageTmpl         = "A panic occurred during %s. Please see logs for more details."
 	fnErrorMessageStderrTmpl = "Function error: %v"
+	runtimeAPIEnv            = "AWS_LAMBDA_RUNTIME_API"
 )
 
 // recoverPanic recovers from a panic in a consistent manner. panicSrc should
@@ -99,50 +101,59 @@ func RegisterCloudEventFunctionContext(ctx context.Context, path string, fn func
 
 // Start serves an HTTP server with registered function(s).
 func Start(port string) error {
-	server, err := initServer()
-	if err != nil {
-		return err
-	}
-	return http.ListenAndServe(":"+port, server)
+	//server, err := initServer()
+	//if err != nil {
+	//	return err
+	//}
+	//return http.ListenAndServe(":"+port, server)
 }
 
-func initServer() (*http.ServeMux, error) {
-	server := http.NewServeMux()
+type startFunc struct {
+	env string
+	f   func(envValue string, target *registry.RegisteredFunction) error
+}
 
+// startRuntimeAPILoop will return an error if handling a particular invoke resulted in a non-recoverable error
+func startRuntimeAPILoop(api string, handler Handler) error {
+	client := newRuntimeAPIClient(api)
+	h := newHandler(handler)
+	for {
+		invoke, err := client.next()
+		if err != nil {
+			return err
+		}
+		if err = handleInvoke(invoke, h); err != nil {
+			return err
+		}
+	}
+}
+
+func start() {
 	// If FUNCTION_TARGET is set, only serve this target function at path "/".
 	// If not set, serve all functions at the registered paths.
+	var targetFn *registry.RegisteredFunction
 	if target := os.Getenv("FUNCTION_TARGET"); len(target) > 0 {
-		var targetFn *registry.RegisteredFunction
 
 		fn, ok := registry.Default().GetRegisteredFunction(target)
 		if ok {
 			targetFn = fn
-		} else if lastFnWithoutName := registry.Default().GetLastFunctionWithoutName(); lastFnWithoutName != nil {
-			// If no function was found with the target name, assume the last function that's not registered declaratively
-			// should be served at '/'.
-			targetFn = lastFnWithoutName
-		} else {
-			return nil, fmt.Errorf("no matching function found with name: %q", target)
 		}
-
 		h, err := wrapFunction(targetFn)
 		if err != nil {
-			return nil, fmt.Errorf("failed to serve function %q: %v", target, err)
+			log.Fatalf("failed to serve function %q: %v", target, err)
 		}
-		server.Handle("/", h)
-		return server, nil
 	}
 
-	fns := registry.Default().GetAllFunctions()
-	for _, fn := range fns {
-		h, err := wrapFunction(fn)
-		if err != nil {
-			return nil, fmt.Errorf("failed to serve function at path %q: %v", fn.Path, err)
-		}
-		server.Handle(fn.Path, h)
+	if lastFnWithoutName := registry.Default().GetLastFunctionWithoutName(); lastFnWithoutName != nil {
+		// If no function was found with the target name, assume the last function that's not registered declaratively
+		// should be served at '/'.
+		targetFn = lastFnWithoutName
+	} else {
+		log.Fatalf("no matching function found")
 	}
-	return server, nil
 }
+
+func newHandler(fn *registry.RegisteredFunction)
 
 func wrapFunction(fn *registry.RegisteredFunction) (http.Handler, error) {
 	// Check if we have a function resource set, and if so, log progress.
@@ -173,6 +184,7 @@ func wrapFunction(fn *registry.RegisteredFunction) (http.Handler, error) {
 }
 
 func wrapHTTPFunction(fn func(http.ResponseWriter, *http.Request)) (http.Handler, error) {
+
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if os.Getenv("K_SERVICE") != "" {
 			// Force flush of logs after every function trigger when running on GCF.
