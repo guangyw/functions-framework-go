@@ -18,15 +18,10 @@ package funcframework
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"log"
 	"net/http"
 	"os"
-	"reflect"
-	"runtime/debug"
-	"strings"
 
 	"github.com/GoogleCloudPlatform/functions-framework-go/internal/registry"
 	cloudevents "github.com/cloudevents/sdk-go/v2"
@@ -41,25 +36,37 @@ const (
 	runtimeAPIEnv            = "AWS_LAMBDA_RUNTIME_API"
 )
 
+type startFunction struct {
+	env string
+	f   func(envValue string, handler handlerFunc) error
+}
+
+var (
+	runtimeAPIStartFunction = &startFunction{
+		env: "AWS_LAMBDA_RUNTIME_API",
+		f:   startRuntimeAPILoop,
+	}
+)
+
 // recoverPanic recovers from a panic in a consistent manner. panicSrc should
 // describe what was happening when the panic was encountered, for example
 // "user function execution". w is an http.ResponseWriter to write a generic
 // response body to that does not expose the details of the panic; w can be
 // nil to skip this.
-func recoverPanic(w http.ResponseWriter, panicSrc string) {
-	if r := recover(); r != nil {
-		genericMsg := fmt.Sprintf(panicMessageTmpl, panicSrc)
-		fmt.Fprintf(os.Stderr, "%s\npanic message: %v\nstack trace: %s", genericMsg, r, debug.Stack())
-		if w != nil {
-			writeHTTPErrorResponse(w, http.StatusInternalServerError, crashStatus, genericMsg)
-		}
-	}
-}
+// func recoverPanic(w http.ResponseWriter, panicSrc string) {
+// 	if r := recover(); r != nil {
+// 		genericMsg := fmt.Sprintf(panicMessageTmpl, panicSrc)
+// 		fmt.Fprintf(os.Stderr, "%s\npanic message: %v\nstack trace: %s", genericMsg, r, debug.Stack())
+// 		if w != nil {
+// 			writeHTTPErrorResponse(w, http.StatusInternalServerError, crashStatus, genericMsg)
+// 		}
+// 	}
+// }
 
 // RegisterHTTPFunction registers fn as an HTTP function.
 // Maintained for backward compatibility. Please use RegisterHTTPFunctionContext instead.
 func RegisterHTTPFunction(path string, fn interface{}) {
-	defer recoverPanic(nil, "function registration")
+	//defer recoverPanic(nil, "function registration")
 
 	fnHTTP, ok := fn.(func(http.ResponseWriter, *http.Request))
 	if !ok {
@@ -76,7 +83,7 @@ func RegisterHTTPFunction(path string, fn interface{}) {
 // Maintained for backward compatibility. Please use RegisterEventFunctionContext instead.
 func RegisterEventFunction(path string, fn interface{}) {
 	ctx := context.Background()
-	defer recoverPanic(nil, "function registration")
+	//defer recoverPanic(nil, "function registration")
 	if err := RegisterEventFunctionContext(ctx, path, fn); err != nil {
 		panic(fmt.Sprintf("unexpected error in RegisterEventFunctionContext: %v", err))
 	}
@@ -100,12 +107,14 @@ func RegisterCloudEventFunctionContext(ctx context.Context, path string, fn func
 }
 
 // Start serves an HTTP server with registered function(s).
-func Start(port string) error {
+func Start() {
 	//server, err := initServer()
 	//if err != nil {
 	//	return err
 	//}
 	//return http.ListenAndServe(":"+port, server)
+
+	start()
 }
 
 type startFunc struct {
@@ -113,24 +122,10 @@ type startFunc struct {
 	f   func(envValue string, target *registry.RegisteredFunction) error
 }
 
-// startRuntimeAPILoop will return an error if handling a particular invoke resulted in a non-recoverable error
-func startRuntimeAPILoop(api string, handler Handler) error {
-	client := newRuntimeAPIClient(api)
-	h := newHandler(handler)
-	for {
-		invoke, err := client.next()
-		if err != nil {
-			return err
-		}
-		if err = handleInvoke(invoke, h); err != nil {
-			return err
-		}
-	}
-}
-
 func start() {
 	// If FUNCTION_TARGET is set, only serve this target function at path "/".
 	// If not set, serve all functions at the registered paths.
+	fmt.Println("Starting")
 	var targetFn *registry.RegisteredFunction
 	if target := os.Getenv("FUNCTION_TARGET"); len(target) > 0 {
 
@@ -138,35 +133,30 @@ func start() {
 		if ok {
 			targetFn = fn
 		}
-		h, err := wrapFunction(targetFn)
-		if err != nil {
-			log.Fatalf("failed to serve function %q: %v", target, err)
-		}
-	}
+		h := newHandler(targetFn)
 
-	if lastFnWithoutName := registry.Default().GetLastFunctionWithoutName(); lastFnWithoutName != nil {
-		// If no function was found with the target name, assume the last function that's not registered declaratively
-		// should be served at '/'.
-		targetFn = lastFnWithoutName
-	} else {
-		log.Fatalf("no matching function found")
+		config := os.Getenv(runtimeAPIStartFunction.env)
+
+		fmt.Printf("config for env %s: %s \n", runtimeAPIStartFunction.env, config)
+		if config != "" {
+			runtimeAPIStartFunction.f(config, h)
+		} else {
+			log.Println("*** expected AWS Lambda environment variables %s are not defined", runtimeAPIStartFunction.env)
+			runtimeAPIStartFunction.f("127.0.0.1:9001", h)
+		}
 	}
 }
 
-func newHandler(fn *registry.RegisteredFunction)
-
-func wrapFunction(fn *registry.RegisteredFunction) (http.Handler, error) {
+func newHandler(fn *registry.RegisteredFunction) handlerFunc {
 	// Check if we have a function resource set, and if so, log progress.
+
+	fmt.Println("Getting Handler")
 	if os.Getenv("FUNCTION_TARGET") == "" {
 		fmt.Printf("Serving function: %q", fn.Name)
 	}
 
 	if fn.HTTPFn != nil {
-		handler, err := wrapHTTPFunction(fn.HTTPFn)
-		if err != nil {
-			return nil, fmt.Errorf("unexpected error in wrapHTTPFunction: %v", err)
-		}
-		return handler, nil
+		return newHttpHandler(fn.HTTPFn)
 	} else if fn.CloudEventFn != nil {
 		handler, err := wrapCloudEventFunction(context.Background(), fn.CloudEventFn)
 		if err != nil {
@@ -180,146 +170,181 @@ func wrapFunction(fn *registry.RegisteredFunction) (http.Handler, error) {
 		}
 		return handler, nil
 	}
-	return nil, fmt.Errorf("missing function entry in %v", fn)
+	return nil
+
 }
 
-func wrapHTTPFunction(fn func(http.ResponseWriter, *http.Request)) (http.Handler, error) {
+//func wrapFunction(fn *registry.RegisteredFunction) (http.Handler, error) {
+//	// Check if we have a function resource set, and if so, log progress.
+//	if os.Getenv("FUNCTION_TARGET") == "" {
+//		fmt.Printf("Serving function: %q", fn.Name)
+//	}
+//
+//	if fn.HTTPFn != nil {
+//		handler, err := wrapHTTPFunction(fn.HTTPFn)
+//		if err != nil {
+//			return nil, fmt.Errorf("unexpected error in wrapHTTPFunction: %v", err)
+//		}
+//		return handler, nil
+//	} else if fn.CloudEventFn != nil {
+//		handler, err := wrapCloudEventFunction(context.Background(), fn.CloudEventFn)
+//		if err != nil {
+//			return nil, fmt.Errorf("unexpected error in wrapCloudEventFunction: %v", err)
+//		}
+//		return handler, nil
+//	} else if fn.EventFn != nil {
+//		handler, err := wrapEventFunction(fn.EventFn)
+//		if err != nil {
+//			return nil, fmt.Errorf("unexpected error in wrapEventFunction: %v", err)
+//		}
+//		return handler, nil
+//	}
+//	return nil, fmt.Errorf("missing function entry in %v", fn)
+//}
 
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if os.Getenv("K_SERVICE") != "" {
-			// Force flush of logs after every function trigger when running on GCF.
-			defer fmt.Println()
-			defer fmt.Fprintln(os.Stderr)
-		}
-		defer recoverPanic(w, "user function execution")
-		fn(w, r)
-	}), nil
+func newHttpHandler(fn func(http.ResponseWriter, *http.Request)) handlerFunc {
+	return httpHandler{
+		fn: fn,
+	}.getHandlerFunc()
 }
 
-func wrapEventFunction(fn interface{}) (http.Handler, error) {
-	err := validateEventFunction(fn)
-	if err != nil {
-		return nil, err
-	}
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if os.Getenv("K_SERVICE") != "" {
-			// Force flush of logs after every function trigger when running on GCF.
-			defer fmt.Println()
-			defer fmt.Fprintln(os.Stderr)
-		}
-
-		if shouldConvertCloudEventToBackgroundRequest(r) {
-			if err := convertCloudEventToBackgroundRequest(r); err != nil {
-				writeHTTPErrorResponse(w, http.StatusBadRequest, crashStatus, fmt.Sprintf("error converting CloudEvent to Background Event: %v", err))
-			}
-		}
-
-		handleEventFunction(w, r, fn)
-	}), nil
-}
-
-func wrapCloudEventFunction(ctx context.Context, fn func(context.Context, cloudevents.Event) error) (http.Handler, error) {
-	p, err := cloudevents.NewHTTP()
-	if err != nil {
-		return nil, fmt.Errorf("failed to create protocol: %v", err)
-	}
-
-	// Always log errors returned by the function to stderr
-	logErrFn := func(ctx context.Context, ce cloudevents.Event) error {
-		err := fn(ctx, ce)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, fmtFunctionError(err))
-		}
-		return err
-	}
-
-	h, err := cloudevents.NewHTTPReceiveHandler(ctx, p, logErrFn)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create handler: %v", err)
-	}
-
-	return convertBackgroundToCloudEvent(h), nil
-}
-
-func handleEventFunction(w http.ResponseWriter, r *http.Request, fn interface{}) {
-	body, err := readHTTPRequestBody(r)
-	if err != nil {
-		writeHTTPErrorResponse(w, http.StatusBadRequest, crashStatus, fmt.Sprintf("%v", err))
-		return
-	}
-
-	// Background events have data and an associated metadata, so parse those and run if present.
-	if metadata, data, err := getBackgroundEvent(body, r.URL.Path); err != nil {
-		writeHTTPErrorResponse(w, http.StatusBadRequest, crashStatus, fmt.Sprintf("Error: %s, parsing background event: %s", err.Error(), string(body)))
-		return
-	} else if data != nil && metadata != nil {
-		runBackgroundEvent(w, r, metadata, data, fn)
-		return
-	}
-
-	// Otherwise, we assume the body is a JSON blob containing the user-specified data structure.
-	runUserFunction(w, r, body, fn)
-}
-
-func readHTTPRequestBody(r *http.Request) ([]byte, error) {
-	if r.Body == nil {
-		return nil, fmt.Errorf("request body not found")
-	}
-
-	body, err := ioutil.ReadAll(r.Body)
-	if err != nil {
-		return nil, fmt.Errorf("could not read request body %s: %v", r.Body, err)
-	}
-
-	return body, nil
-}
-
-func runUserFunction(w http.ResponseWriter, r *http.Request, data []byte, fn interface{}) {
-	runUserFunctionWithContext(r.Context(), w, r, data, fn)
-}
-
-func runUserFunctionWithContext(ctx context.Context, w http.ResponseWriter, r *http.Request, data []byte, fn interface{}) {
-	argVal := reflect.New(reflect.TypeOf(fn).In(1))
-	if err := json.Unmarshal(data, argVal.Interface()); err != nil {
-		writeHTTPErrorResponse(w, http.StatusBadRequest, crashStatus, fmt.Sprintf("Error: %s, while converting event data: %s", err.Error(), string(data)))
-		return
-	}
-
-	defer recoverPanic(w, "user function execution")
-	userFunErr := reflect.ValueOf(fn).Call([]reflect.Value{
-		reflect.ValueOf(ctx),
-		argVal.Elem(),
-	})
-	if userFunErr[0].Interface() != nil {
-		writeHTTPErrorResponse(w, http.StatusInternalServerError, errorStatus, fmtFunctionError(userFunErr[0].Interface()))
-		return
-	}
-}
-
-func fmtFunctionError(err interface{}) string {
-	formatted := fmt.Sprintf(fnErrorMessageStderrTmpl, err)
-	if !strings.HasSuffix(formatted, "\n") {
-		formatted += "\n"
-	}
-
-	return formatted
-}
-
-func writeHTTPErrorResponse(w http.ResponseWriter, statusCode int, status, msg string) {
-	// Ensure logs end with a newline otherwise they are grouped incorrectly in SD.
-	if !strings.HasSuffix(msg, "\n") {
-		msg += "\n"
-	}
-	fmt.Fprint(os.Stderr, msg)
-
-	// Flush stdout and stderr when running on GCF. This must be done before writing
-	// the HTTP response in order for all logs to appear in GCF.
-	if os.Getenv("K_SERVICE") != "" {
-		fmt.Println()
-		fmt.Fprintln(os.Stderr)
-	}
-
-	w.Header().Set(functionStatusHeader, status)
-	w.WriteHeader(statusCode)
-	fmt.Fprint(w, msg)
-}
+//func wrapHTTPFunction(fn func(http.ResponseWriter, *http.Request)) (http.Handler, error) {
+//
+//	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+//		if os.Getenv("K_SERVICE") != "" {
+//			// Force flush of logs after every function trigger when running on GCF.
+//			defer fmt.Println()
+//			defer fmt.Fprintln(os.Stderr)
+//		}
+//		defer recoverPanic(w, "user function execution")
+//		fn(w, r)
+//	}), nil
+//}
+//
+//func wrapEventFunction(fn interface{}) (http.Handler, error) {
+//	err := validateEventFunction(fn)
+//	if err != nil {
+//		return nil, err
+//	}
+//	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+//		if os.Getenv("K_SERVICE") != "" {
+//			// Force flush of logs after every function trigger when running on GCF.
+//			defer fmt.Println()
+//			defer fmt.Fprintln(os.Stderr)
+//		}
+//
+//		if shouldConvertCloudEventToBackgroundRequest(r) {
+//			if err := convertCloudEventToBackgroundRequest(r); err != nil {
+//				writeHTTPErrorResponse(w, http.StatusBadRequest, crashStatus, fmt.Sprintf("error converting CloudEvent to Background Event: %v", err))
+//			}
+//		}
+//
+//		handleEventFunction(w, r, fn)
+//	}), nil
+//}
+//
+//func wrapCloudEventFunction(ctx context.Context, fn func(context.Context, cloudevents.Event) error) (http.Handler, error) {
+//	p, err := cloudevents.NewHTTP()
+//	if err != nil {
+//		return nil, fmt.Errorf("failed to create protocol: %v", err)
+//	}
+//
+//	// Always log errors returned by the function to stderr
+//	logErrFn := func(ctx context.Context, ce cloudevents.Event) error {
+//		err := fn(ctx, ce)
+//		if err != nil {
+//			fmt.Fprintf(os.Stderr, fmtFunctionError(err))
+//		}
+//		return err
+//	}
+//
+//	h, err := cloudevents.NewHTTPReceiveHandler(ctx, p, logErrFn)
+//	if err != nil {
+//		return nil, fmt.Errorf("failed to create handler: %v", err)
+//	}
+//
+//	return convertBackgroundToCloudEvent(h), nil
+//}
+//
+//func handleEventFunction(w http.ResponseWriter, r *http.Request, fn interface{}) {
+//	body, err := readHTTPRequestBody(r)
+//	if err != nil {
+//		writeHTTPErrorResponse(w, http.StatusBadRequest, crashStatus, fmt.Sprintf("%v", err))
+//		return
+//	}
+//
+//	// Background events have data and an associated metadata, so parse those and run if present.
+//	if metadata, data, err := getBackgroundEvent(body, r.URL.Path); err != nil {
+//		writeHTTPErrorResponse(w, http.StatusBadRequest, crashStatus, fmt.Sprintf("Error: %s, parsing background event: %s", err.Error(), string(body)))
+//		return
+//	} else if data != nil && metadata != nil {
+//		runBackgroundEvent(w, r, metadata, data, fn)
+//		return
+//	}
+//
+//	// Otherwise, we assume the body is a JSON blob containing the user-specified data structure.
+//	runUserFunction(w, r, body, fn)
+//}
+//
+//func readHTTPRequestBody(r *http.Request) ([]byte, error) {
+//	if r.Body == nil {
+//		return nil, fmt.Errorf("request body not found")
+//	}
+//
+//	body, err := ioutil.ReadAll(r.Body)
+//	if err != nil {
+//		return nil, fmt.Errorf("could not read request body %s: %v", r.Body, err)
+//	}
+//
+//	return body, nil
+//}
+//
+//func runUserFunction(w http.ResponseWriter, r *http.Request, data []byte, fn interface{}) {
+//	runUserFunctionWithContext(r.Context(), w, r, data, fn)
+//}
+//
+//func runUserFunctionWithContext(ctx context.Context, w http.ResponseWriter, r *http.Request, data []byte, fn interface{}) {
+//	argVal := reflect.New(reflect.TypeOf(fn).In(1))
+//	if err := json.Unmarshal(data, argVal.Interface()); err != nil {
+//		writeHTTPErrorResponse(w, http.StatusBadRequest, crashStatus, fmt.Sprintf("Error: %s, while converting event data: %s", err.Error(), string(data)))
+//		return
+//	}
+//
+//	defer recoverPanic(w, "user function execution")
+//	userFunErr := reflect.ValueOf(fn).Call([]reflect.Value{
+//		reflect.ValueOf(ctx),
+//		argVal.Elem(),
+//	})
+//	if userFunErr[0].Interface() != nil {
+//		writeHTTPErrorResponse(w, http.StatusInternalServerError, errorStatus, fmtFunctionError(userFunErr[0].Interface()))
+//		return
+//	}
+//}
+//
+//func fmtFunctionError(err interface{}) string {
+//	formatted := fmt.Sprintf(fnErrorMessageStderrTmpl, err)
+//	if !strings.HasSuffix(formatted, "\n") {
+//		formatted += "\n"
+//	}
+//
+//	return formatted
+//}
+//
+//func writeHTTPErrorResponse(w http.ResponseWriter, statusCode int, status, msg string) {
+//	// Ensure logs end with a newline otherwise they are grouped incorrectly in SD.
+//	if !strings.HasSuffix(msg, "\n") {
+//		msg += "\n"
+//	}
+//	fmt.Fprint(os.Stderr, msg)
+//
+//	// Flush stdout and stderr when running on GCF. This must be done before writing
+//	// the HTTP response in order for all logs to appear in GCF.
+//	if os.Getenv("K_SERVICE") != "" {
+//		fmt.Println()
+//		fmt.Fprintln(os.Stderr)
+//	}
+//
+//	w.Header().Set(functionStatusHeader, status)
+//	w.WriteHeader(statusCode)
+//	fmt.Fprint(w, msg)
+//}

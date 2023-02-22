@@ -3,6 +3,8 @@ package funcframework
 import (
 	"bytes"
 	"context"
+	"io"
+	"io/ioutil"
 	"net/http"
 )
 
@@ -12,6 +14,16 @@ import (
 type httpHandler struct {
 	fn func(http.ResponseWriter, *http.Request)
 	//Invoke(ctx context.Context, payload []byte) ([]byte, error)
+}
+
+func (h httpHandler) getHandlerFunc() handlerFunc {
+	return func(ctx context.Context, payload []byte) (io.Reader, error) {
+		b, err := h.Invoke(ctx, payload)
+		if err != nil {
+			return nil, err
+		}
+		return bytes.NewBuffer(b), nil
+	}
 }
 
 func (h httpHandler) Invoke(ctx context.Context, payload []byte) ([]byte, error) {
@@ -26,7 +38,7 @@ func (h httpHandler) Invoke(ctx context.Context, payload []byte) ([]byte, error)
 
 	h.fn(&writer, req)
 
-	return nil, nil
+	return ioutil.ReadAll(&writer.Buffer)
 }
 
 type httpWriter struct {
