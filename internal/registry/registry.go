@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 
+	"github.com/GoogleCloudPlatform/functions-framework-go/internal/funchandlers"
 	cloudevents "github.com/cloudevents/sdk-go/v2"
 )
 
@@ -17,6 +18,17 @@ type RegisteredFunction struct {
 	HTTPFn       func(http.ResponseWriter, *http.Request)       // Optional: The user's HTTP function
 	EventFn      interface{}                                    // Optional: The user's Event function
 	TypedFn      interface{}                                    // Optional: The user's typed function
+}
+
+func (fn *RegisteredFunction) GetHandler() funchandlers.Handler {
+	switch {
+	case fn.HTTPFn != nil:
+		return funchandlers.HttpHandler{Fn: fn.HTTPFn}
+	case fn.CloudEventFn != nil:
+		return funchandlers.CloudEventHandler{Fn: fn.CloudEventFn}
+	}
+
+	return nil
 }
 
 // Option is an option used when registering a function.

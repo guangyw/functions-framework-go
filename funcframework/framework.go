@@ -20,13 +20,15 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"os"
 	"reflect"
 	"runtime/debug"
 	"strings"
 
+	frameworkclient "github.com/GoogleCloudPlatform/functions-framework-go/internal/client"
+	"github.com/GoogleCloudPlatform/functions-framework-go/internal/funchandlers"
 	"github.com/GoogleCloudPlatform/functions-framework-go/internal/registry"
 	cloudevents "github.com/cloudevents/sdk-go/v2"
 )
@@ -99,18 +101,7 @@ func RegisterCloudEventFunctionContext(ctx context.Context, path string, fn func
 	return registry.Default().RegisterCloudEvent(fn, registry.WithPath(path))
 }
 
-// Start serves an HTTP server with registered function(s).
-func Start(port string) error {
-	server, err := initServer()
-	if err != nil {
-		return err
-	}
-	return http.ListenAndServe(":"+port, server)
-}
-
-func initServer() (*http.ServeMux, error) {
-	server := http.NewServeMux()
-
+func Start() {
 	// If FUNCTION_TARGET is set, only serve this target function at path "/".
 	// If not set, serve all functions at the registered paths.
 	if target := os.Getenv("FUNCTION_TARGET"); len(target) > 0 {
@@ -124,209 +115,66 @@ func initServer() (*http.ServeMux, error) {
 			// should be served at '/'.
 			targetFn = lastFnWithoutName
 		} else {
-			return nil, fmt.Errorf("no matching function found with name: %q", target)
-		}
-
-		h, err := wrapFunction(targetFn)
-		if err != nil {
-			return nil, fmt.Errorf("failed to serve function %q: %v", target, err)
-		}
-		server.Handle("/", h)
-		return server, nil
-	}
-
-	fns := registry.Default().GetAllFunctions()
-	for _, fn := range fns {
-		h, err := wrapFunction(fn)
-		if err != nil {
-			return nil, fmt.Errorf("failed to serve function at path %q: %v", fn.Path, err)
-		}
-		server.Handle(fn.Path, h)
-	}
-	return server, nil
-}
-
-func wrapFunction(fn *registry.RegisteredFunction) (http.Handler, error) {
-	// Check if we have a function resource set, and if so, log progress.
-	if os.Getenv("FUNCTION_TARGET") == "" {
-		fmt.Printf("Serving function: %q", fn.Name)
-	}
-
-	if fn.HTTPFn != nil {
-		handler, err := wrapHTTPFunction(fn.HTTPFn)
-		if err != nil {
-			return nil, fmt.Errorf("unexpected error in wrapHTTPFunction: %v", err)
-		}
-		return handler, nil
-	} else if fn.CloudEventFn != nil {
-		handler, err := wrapCloudEventFunction(context.Background(), fn.CloudEventFn)
-		if err != nil {
-			return nil, fmt.Errorf("unexpected error in wrapCloudEventFunction: %v", err)
-		}
-		return handler, nil
-	} else if fn.EventFn != nil {
-		handler, err := wrapEventFunction(fn.EventFn)
-		if err != nil {
-			return nil, fmt.Errorf("unexpected error in wrapEventFunction: %v", err)
-		}
-		return handler, nil
-	} else if fn.TypedFn != nil {
-		handler, err := wrapTypedFunction(fn.TypedFn)
-		if err != nil {
-			return nil, fmt.Errorf("unexpected error in wrapTypedFunction: %v", err)
-		}
-		return handler, nil
-	}
-	return nil, fmt.Errorf("missing function entry in %v", fn)
-}
-
-func wrapHTTPFunction(fn func(http.ResponseWriter, *http.Request)) (http.Handler, error) {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if os.Getenv("K_SERVICE") != "" {
-			// Force flush of logs after every function trigger when running on GCF.
-			defer fmt.Println()
-			defer fmt.Fprintln(os.Stderr)
-		}
-		defer recoverPanic(w, "user function execution")
-		fn(w, r)
-	}), nil
-}
-
-func wrapEventFunction(fn interface{}) (http.Handler, error) {
-	err := validateEventFunction(fn)
-	if err != nil {
-		return nil, err
-	}
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if os.Getenv("K_SERVICE") != "" {
-			// Force flush of logs after every function trigger when running on GCF.
-			defer fmt.Println()
-			defer fmt.Fprintln(os.Stderr)
-		}
-
-		if shouldConvertCloudEventToBackgroundRequest(r) {
-			if err := convertCloudEventToBackgroundRequest(r); err != nil {
-				writeHTTPErrorResponse(w, http.StatusBadRequest, crashStatus, fmt.Sprintf("error converting CloudEvent to Background Event: %v", err))
-			}
-		}
-
-		handleEventFunction(w, r, fn)
-	}), nil
-}
-
-func wrapTypedFunction(fn interface{}) (http.Handler, error) {
-	inputType, err := validateTypedFunction(fn)
-	if err != nil {
-		return nil, err
-	}
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		body, err := readHTTPRequestBody(r)
-		if err != nil {
-			writeHTTPErrorResponse(w, http.StatusBadRequest, crashStatus, fmt.Sprintf("%v", err))
-			return
-		}
-		argVal := inputType
-
-		if err := json.Unmarshal(body, argVal.Interface()); err != nil {
-			writeHTTPErrorResponse(w, http.StatusBadRequest, crashStatus, fmt.Sprintf("Error while converting input data. %s", err.Error()))
 			return
 		}
 
-		defer recoverPanic(w, "user function execution")
-		funcReturn := reflect.ValueOf(fn).Call([]reflect.Value{
-			argVal.Elem(),
-		})
+		h := targetFn.GetHandler()
 
-		handleTypedReturn(w, funcReturn)
-	}), nil
-}
-
-func handleTypedReturn(w http.ResponseWriter, funcReturn []reflect.Value) {
-	if len(funcReturn) == 0 {
-		return
-	}
-	errorVal := funcReturn[len(funcReturn)-1].Interface() // last return must be of type error
-	if errorVal != nil && reflect.TypeOf(errorVal).AssignableTo(errorType) {
-		writeHTTPErrorResponse(w, http.StatusInternalServerError, errorStatus, fmtFunctionError(errorVal))
-		return
-	}
-
-	firstVal := funcReturn[0].Interface()
-	if !reflect.TypeOf(firstVal).AssignableTo(errorType) {
-		returnVal, _ := json.Marshal(firstVal)
-		fmt.Fprintf(w, string(returnVal))
-	}
-}
-
-func validateTypedFunction(fn interface{}) (*reflect.Value, error) {
-	ft := reflect.TypeOf(fn)
-	if ft.NumIn() != 1 {
-		return nil, fmt.Errorf("expected function to have one parameters, found %d", ft.NumIn())
-	}
-	if ft.NumOut() > 2 {
-		return nil, fmt.Errorf("expected function to have maximum two return values")
-	}
-	if ft.NumOut() > 0 && !ft.Out(ft.NumOut()-1).AssignableTo(errorType) {
-		return nil, fmt.Errorf("expected last return type to be of error")
-	}
-	var inputType = reflect.New(ft.In(0))
-	return &inputType, nil
-}
-
-func wrapCloudEventFunction(ctx context.Context, fn func(context.Context, cloudevents.Event) error) (http.Handler, error) {
-	p, err := cloudevents.NewHTTP()
-	if err != nil {
-		return nil, fmt.Errorf("failed to create protocol: %v", err)
-	}
-
-	// Always log errors returned by the function to stderr
-	logErrFn := func(ctx context.Context, ce cloudevents.Event) error {
-		err := fn(ctx, ce)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, fmtFunctionError(err))
+		apiAddr := os.Getenv("AWS_LAMBDA_RUNTIME_API")
+		if apiAddr != "" {
+			startRequestLoop(apiAddr, h.GetHandlerFunc())
+		} else {
+			startRequestLoop("127.0.0.1:9001", h.GetHandlerFunc())
 		}
-		return err
 	}
 
-	h, err := cloudevents.NewHTTPReceiveHandler(ctx, p, logErrFn)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create handler: %v", err)
-	}
-
-	return convertBackgroundToCloudEvent(h), nil
+	//fns := registry.Default().GetAllFunctions()
+	//for _, fn := range fns {
+	//	h, err := wrapFunction(fn)
+	//}
 }
 
-func handleEventFunction(w http.ResponseWriter, r *http.Request, fn interface{}) {
-	body, err := readHTTPRequestBody(r)
-	if err != nil {
-		writeHTTPErrorResponse(w, http.StatusBadRequest, crashStatus, fmt.Sprintf("%v", err))
-		return
+func startRequestLoop(api string, h funchandlers.HandlerFunc) error {
+	fmt.Printf("api: %s \n", api)
+	client := frameworkclient.New(api)
+	for {
+		invoke, err := client.Next()
+		fmt.Printf("get invocation %v \n", invoke)
+		if err != nil {
+			fmt.Printf("fetch invocation error:%v \n", err)
+			return err
+		}
+		if err = handleInvoke(invoke, h); err != nil {
+			return err
+		}
 	}
-
-	// Background events have data and an associated metadata, so parse those and run if present.
-	if metadata, data, err := getBackgroundEvent(body, r.URL.Path); err != nil {
-		writeHTTPErrorResponse(w, http.StatusBadRequest, crashStatus, fmt.Sprintf("Error: %s, parsing background event: %s", err.Error(), string(body)))
-		return
-	} else if data != nil && metadata != nil {
-		runBackgroundEvent(w, r, metadata, data, fn)
-		return
-	}
-
-	// Otherwise, we assume the body is a JSON blob containing the user-specified data structure.
-	runUserFunction(w, r, body, fn)
 }
 
-func readHTTPRequestBody(r *http.Request) ([]byte, error) {
-	if r.Body == nil {
-		return nil, fmt.Errorf("request body not found")
+// handleInvoke returns an error if the function panics, or some other non-recoverable error occurred
+func handleInvoke(invoke *frameworkclient.Invoke, handler funchandlers.HandlerFunc) error {
+	// call the handler, marshal any returned error
+	// fmt.Fprintln("payload: %s", invoke.payload)
+	response, invokeErr := handler(context.Background(), invoke.Payload)
+	if invokeErr != nil {
+		return nil
+	}
+	// if the response needs to be closed (ex: net.Conn, os.File), ensure it's closed before the next invoke to prevent a resource leak
+	if response, ok := response.(io.Closer); ok {
+		defer response.Close()
 	}
 
-	body, err := ioutil.ReadAll(r.Body)
-	if err != nil {
-		return nil, fmt.Errorf("could not read request body %s: %v", r.Body, err)
+	// if the response defines a content-type, plumb it through
+	contentType := "application/octet-stream"
+	type ContentType interface{ ContentType() string }
+	if response, ok := response.(ContentType); ok {
+		contentType = response.ContentType()
 	}
 
-	return body, nil
+	if err := invoke.Success(response, contentType); err != nil {
+		return fmt.Errorf("unexpected error occurred when sending the function functionResponse to the API: %v", err)
+	}
+
+	return nil
 }
 
 func runUserFunction(w http.ResponseWriter, r *http.Request, data []byte, fn interface{}) {

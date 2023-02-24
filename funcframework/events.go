@@ -281,6 +281,19 @@ func firebaseAuthSubject(data interface{}) (string, error) {
 	return fmt.Sprintf("users/%v", d["uid"]), nil
 }
 
+func readHTTPRequestBody(r *http.Request) ([]byte, error) {
+	if r.Body == nil {
+		return nil, fmt.Errorf("request body not found")
+	}
+
+	body, err := ioutil.ReadAll(r.Body)
+	if err != nil {
+		return nil, fmt.Errorf("could not read request body %s: %v", r.Body, err)
+	}
+
+	return body, nil
+}
+
 func convertBackgroundToCloudEventRequest(r *http.Request) error {
 	body, err := readHTTPRequestBody(r)
 	if err != nil {
